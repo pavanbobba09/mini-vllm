@@ -147,8 +147,29 @@ class TokenStream:
                 yield delta
 
 
-def create_app(worker: EngineWorker, model_name: str = DEFAULT_MODEL_ID) -> FastAPI:
+def create_app(
+    worker: EngineWorker,
+    model_name: str = DEFAULT_MODEL_ID,
+    api_key: Optional[str] = None,
+) -> FastAPI:
     app = FastAPI(title="mini-vllm")
+
+    if api_key:
+        # Public deployments must not serve anonymous compute; openai clients
+        # send their api_key as exactly this Bearer header.
+        @app.middleware("http")
+        async def require_api_key(request, call_next):
+            if request.url.path.startswith("/v1"):
+                if request.headers.get("authorization") != f"Bearer {api_key}":
+                    return JSONResponse(
+                        {"error": {"message": "invalid API key", "type": "invalid_request_error"}},
+                        status_code=401,
+                    )
+            return await call_next(request)
+
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        return JSONResponse({"status": "ok", "model": model_name})
 
     @app.get("/v1/models")
     async def list_models() -> JSONResponse:
@@ -272,6 +293,7 @@ async def _sse_stream(
 
 def main() -> None:
     import argparse
+    import os
 
     import uvicorn
 
@@ -293,7 +315,10 @@ def main() -> None:
         engine.tokenizer,
         EngineConfig(num_blocks=args.num_blocks, max_num_seqs=args.max_num_seqs),
     )
-    uvicorn.run(create_app(worker, model_name=args.model), host=args.host, port=args.port)
+    app = create_app(
+        worker, model_name=args.model, api_key=os.environ.get("MINI_VLLM_API_KEY")
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

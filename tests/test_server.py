@@ -158,6 +158,42 @@ def test_models_endpoint(client):
     assert models.data[0].id == "tiny-test-model"
 
 
+@pytest.fixture(scope="module")
+def secured_server(worker):
+    app = create_app(worker, model_name="tiny-test-model", api_key="sk-test-key")
+    port = free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    uvicorn_server = uvicorn.Server(config)
+    thread = threading.Thread(target=uvicorn_server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not uvicorn_server.started:
+        if time.time() > deadline:
+            raise RuntimeError("uvicorn did not start")
+        time.sleep(0.05)
+    yield f"http://127.0.0.1:{port}"
+    uvicorn_server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_api_key_required_when_configured(secured_server):
+    import httpx
+    from openai import AuthenticationError
+
+    wrong = OpenAI(base_url=f"{secured_server}/v1", api_key="wrong-key", max_retries=0)
+    with pytest.raises(AuthenticationError):
+        wrong.completions.create(model="tiny-test-model", prompt="1 2 3", max_tokens=2)
+
+    right = OpenAI(base_url=f"{secured_server}/v1", api_key="sk-test-key", max_retries=0)
+    completion = right.completions.create(
+        model="tiny-test-model", prompt="1 2 3", max_tokens=2, temperature=0.0
+    )
+    assert completion.choices[0].text
+
+    # Health endpoint stays open for platform checks.
+    assert httpx.get(f"{secured_server}/health").status_code == 200
+
+
 def test_client_disconnect_aborts_request(client, worker):
     """Closing an SSE stream early must free the engine slot, not run to max_tokens."""
 
