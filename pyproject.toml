@@ -11,8 +11,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+]
 dev = [
   "pytest>=8.0",
+  "openai>=1.30",
 ]
 
 [tool.pytest.ini_options]
