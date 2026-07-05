@@ -225,6 +225,20 @@ MINI_VLLM_RUN_PARITY=1 MINI_VLLM_TEST_DEVICE=cpu MINI_VLLM_TEST_DTYPE=float32 \
 The engine picks CUDA, then Apple MPS, then CPU automatically; override with
 `--device` and `--dtype` on the server and benchmark.
 
+## Deploying
+
+The repo ships a Dockerfile sized for free CPU hosting. Set the
+`MINI_VLLM_API_KEY` environment variable to require an API key on `/v1/*`
+(`GET /health` stays open for platform probes):
+
+```bash
+docker build -t mini-vllm .
+docker run -e MINI_VLLM_API_KEY=sk-demo -p 7860:7860 mini-vllm
+```
+
+Step-by-step instructions for a free public deployment on Hugging Face Spaces
+are in [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ## Project structure
 
 | path | what it does |
