@@ -9,8 +9,15 @@ import torch
 from torch import nn
 
 from engine.config import ModelConfig, resolve_device, resolve_dtype
+from engine.kv_cache import PagedBatchMeta, PagedKVCache
 from engine.layers import QwenDecoderLayer, QwenRMSNorm
-from engine.weights import load_safetensors_state_dict, resolve_model_path, safetensor_files
+from engine.rope import RotaryEmbedding
+from engine.weights import (
+    load_safetensors_state_dict,
+    remap_hf_state_dict,
+    resolve_model_path,
+    safetensor_files,
+)
 
 
 class MiniQwenModel(nn.Module):
@@ -22,19 +29,34 @@ class MiniQwenModel(nn.Module):
             [QwenDecoderLayer(config=config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # One rotary table for the whole stack; every layer shares the same angles.
+        self.rotary_emb = RotaryEmbedding(
+            config.attention_head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[PagedKVCache] = None,
+        meta: Optional[PagedBatchMeta] = None,
     ) -> torch.Tensor:
         if position_ids is None:
             position_ids = make_position_ids(input_ids, attention_mask)
 
         hidden_states = self.embed_tokens(input_ids)
+        rope = self.rotary_emb(position_ids, dtype=hidden_states.dtype)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids=position_ids, attention_mask=attention_mask)
+            hidden_states = layer(
+                hidden_states,
+                rope=rope,
+                attention_mask=attention_mask,
+                kv_cache=kv_cache,
+                meta=meta,
+            )
         return self.norm(hidden_states)
 
 
@@ -60,6 +82,7 @@ class MiniQwenForCausalLM(nn.Module):
         model = cls(config)
 
         state_dict = load_safetensors_state_dict(safetensor_files(model_dir))
+        state_dict = remap_hf_state_dict(state_dict, config.num_hidden_layers)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if config.tie_word_embeddings and "lm_head.weight" in missing:
             model.lm_head.weight = model.model.embed_tokens.weight
@@ -79,8 +102,16 @@ class MiniQwenForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[PagedKVCache] = None,
+        meta: Optional[PagedBatchMeta] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        hidden_states = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            kv_cache=kv_cache,
+            meta=meta,
+        )
         return self.lm_head(hidden_states)
 
 

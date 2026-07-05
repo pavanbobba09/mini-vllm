@@ -7,6 +7,12 @@ from torch import nn
 
 
 class RotaryEmbedding(nn.Module):
+    """Precomputes cos/sin for all positions once; forward is a table lookup.
+
+    Owned by the model, not by each layer: every layer uses the same angles, so
+    computing them once per step removes 24x redundant work.
+    """
+
     def __init__(self, dim: int, max_position_embeddings: int, base: float) -> None:
         super().__init__()
         self.dim = dim
@@ -14,14 +20,17 @@ class RotaryEmbedding(nn.Module):
         self.base = base
 
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        positions = torch.arange(max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        # Tables stay fp32; long-position angles lose precision in fp16.
+        self.register_buffer("cos_table", emb.cos(), persistent=False)
+        self.register_buffer("sin_table", emb.sin(), persistent=False)
 
     def forward(self, position_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        # Frequencies stay in fp32 so long prompts do not lose position precision.
-        inv_freq = self.inv_freq.to(position_ids.device)
-        freqs = torch.einsum("bs,d->bsd", position_ids.float(), inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+        cos = self.cos_table[position_ids]
+        sin = self.sin_table[position_ids]
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:

@@ -61,6 +61,23 @@ def safetensor_files(model_dir: str | Path) -> List[Path]:
     return files
 
 
+def remap_hf_state_dict(hf_state: Dict[str, torch.Tensor], num_layers: int) -> Dict[str, torch.Tensor]:
+    """Map HF checkpoint names onto our module tree.
+
+    Most names match by construction; the one deliberate difference is the fused
+    QKV projection, built by concatenating HF q/k/v tensors in q, k, v order
+    (the same order the attention forward splits them back out).
+    """
+
+    out = dict(hf_state)
+    for layer in range(num_layers):
+        prefix = f"model.layers.{layer}.self_attn."
+        for kind in ("weight", "bias"):
+            parts = [out.pop(f"{prefix}{name}.{kind}") for name in ("q_proj", "k_proj", "v_proj")]
+            out[f"{prefix}qkv_proj.{kind}"] = torch.cat(parts, dim=0)
+    return out
+
+
 def load_safetensors_state_dict(files: Iterable[Path]) -> Dict[str, torch.Tensor]:
     """Load all shards onto CPU before the model is moved to its runtime device."""
 

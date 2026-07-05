@@ -10,7 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from engine.config import ModelConfig
-from engine.rope import RotaryEmbedding, apply_rotary_pos_emb
+from engine.kv_cache import PagedBatchMeta, PagedKVCache
+from engine.rope import apply_rotary_pos_emb
 
 
 class QwenRMSNorm(nn.Module):
@@ -65,34 +66,49 @@ class QwenAttention(nn.Module):
         if self.num_heads % self.num_key_value_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
 
-        self.q_proj = nn.Linear(config.hidden_size, config.query_hidden_size, bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, config.kv_hidden_size, bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, config.kv_hidden_size, bias=config.attention_bias)
-        self.o_proj = nn.Linear(config.query_hidden_size, config.hidden_size, bias=False)
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+        # One fused projection instead of three: fewer kernel launches per step.
+        # The loader concatenates HF q/k/v tensors in this exact order.
+        self.q_size = config.query_hidden_size
+        self.kv_size = config.kv_hidden_size
+        self.qkv_proj = nn.Linear(
+            config.hidden_size, self.q_size + 2 * self.kv_size, bias=config.attention_bias
         )
+        self.o_proj = nn.Linear(config.query_hidden_size, config.hidden_size, bias=False)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[PagedKVCache] = None,
+        meta: Optional[PagedBatchMeta] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
 
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(position_ids, dtype=query_states.dtype)
+        cos, sin = rope
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if kv_cache is not None:
+            assert meta is not None, "paged attention needs PagedBatchMeta"
+            # Cache stores post-RoPE K/V, KV heads only; repeat_kv happens after reads.
+            key_flat = key_states.transpose(1, 2).reshape(batch_size * seq_len, self.num_key_value_heads, self.head_dim)
+            value_flat = value_states.transpose(1, 2).reshape(
+                batch_size * seq_len, self.num_key_value_heads, self.head_dim
+            )
+            kv_cache.write(self.layer_idx, key_flat, value_flat, meta.slot_mapping)
+            if not meta.is_prefill:
+                return self._decode_with_cache(query_states, kv_cache, meta)
+            # Prefill always starts at position 0 in v1, so the in-step K/V is the
+            # whole context and the regular causal path below applies unchanged.
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -106,6 +122,39 @@ class QwenAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        return self.o_proj(attn_output)
+
+    def _decode_with_cache(
+        self,
+        query_states: torch.Tensor,
+        kv_cache: PagedKVCache,
+        meta: PagedBatchMeta,
+    ) -> torch.Tensor:
+        """Decode attention over the paged cache; vLLM's fused paged_attention
+        kernel does this in one pass without materializing padded K/V."""
+
+        batch_size = query_states.shape[0]
+        key_states, value_states = kv_cache.gather(self.layer_idx, meta.block_tables)
+        key_states = key_states.transpose(1, 2)  # [batch, kv_heads, padded_len, head_dim]
+        value_states = value_states.transpose(1, 2)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # Padding blocks and unwritten slots hold garbage; mask beyond true length.
+        padded_len = key_states.shape[2]
+        positions = torch.arange(padded_len, device=query_states.device)
+        invalid = positions[None, :] >= meta.context_lens[:, None]  # [batch, padded_len]
+        attn_weights = attn_weights.masked_fill(
+            invalid[:, None, None, :], torch.finfo(attn_weights.dtype).min
+        )
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, 1, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
     def _apply_masks(
@@ -139,12 +188,20 @@ class QwenDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[PagedKVCache] = None,
+        meta: Optional[PagedBatchMeta] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids=position_ids, attention_mask=attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states,
+            rope=rope,
+            attention_mask=attention_mask,
+            kv_cache=kv_cache,
+            meta=meta,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states

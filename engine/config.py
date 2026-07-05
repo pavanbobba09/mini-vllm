@@ -93,6 +93,24 @@ class ModelConfig:
         return self.num_attention_heads * self.attention_head_dim
 
 
+@dataclass(frozen=True)
+class EngineConfig:
+    """Serving-side knobs, independent of model architecture."""
+
+    block_size: int = 16  # tokens per KV block; waste is bounded by block_size - 1 slots
+    num_blocks: int = 512  # KV memory budget = num_blocks * block_size tokens
+    max_num_seqs: int = 8  # decode batch cap
+    watermark_blocks: int = 4  # admission headroom so running seqs can still grow
+
+    def __post_init__(self) -> None:
+        if self.block_size <= 0 or self.num_blocks <= 0:
+            raise ValueError("block_size and num_blocks must be positive")
+        if self.max_num_seqs <= 0:
+            raise ValueError("max_num_seqs must be positive")
+        if self.watermark_blocks < 0:
+            raise ValueError("watermark_blocks must be non-negative")
+
+
 def resolve_device(device: str | torch.device | None = None) -> torch.device:
     """Pick a practical default device for local iteration."""
 

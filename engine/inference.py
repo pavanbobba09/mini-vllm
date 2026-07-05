@@ -1,12 +1,14 @@
-"""Small inference helpers for Milestone 1."""
+"""Inference paths: the M1 full-recompute reference and the M2 paged decode."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
+from engine.block_manager import BlockManager
+from engine.kv_cache import PagedKVCache, make_meta
 from engine.model import MiniQwenForCausalLM
 from engine.tokenizer import Tokenizer
 
@@ -96,6 +98,92 @@ def greedy_decode(
             if torch.all(finished):
                 break
     return generated
+
+
+# The M1 oracle: later milestones are verified by matching this cache-free path.
+reference_generate = greedy_decode
+
+
+@torch.no_grad()
+def paged_prefill(
+    model: MiniQwenForCausalLM,
+    kv_cache: PagedKVCache,
+    block_manager: BlockManager,
+    seq_id: int,
+    prompt_ids: Sequence[int],
+) -> torch.Tensor:
+    """Run the whole prompt once, filling its KV blocks; returns last-position logits [vocab]."""
+
+    device = next(model.parameters()).device
+    num_tokens = len(prompt_ids)
+    block_manager.allocate_sequence(seq_id, num_tokens)
+    meta = make_meta(
+        slot_mapping=block_manager.slots_for_range(seq_id, 0, num_tokens),
+        block_tables=[block_manager.block_table(seq_id)],
+        context_lens=[num_tokens],
+        is_prefill=True,
+        device=device,
+    )
+    input_ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=device)
+    position_ids = torch.arange(num_tokens, device=device).unsqueeze(0)
+    logits = model(input_ids, position_ids=position_ids, kv_cache=kv_cache, meta=meta)
+    return logits[0, -1, :]
+
+
+@torch.no_grad()
+def paged_decode_step(
+    model: MiniQwenForCausalLM,
+    kv_cache: PagedKVCache,
+    block_manager: BlockManager,
+    seq_ids: Sequence[int],
+    last_tokens: Sequence[int],
+) -> torch.Tensor:
+    """One batched decode step over ragged sequences; returns logits [batch, vocab]."""
+
+    device = next(model.parameters()).device
+    slot_mapping = [block_manager.append_token(seq_id) for seq_id in seq_ids]
+    context_lens = [block_manager.num_tokens(seq_id) for seq_id in seq_ids]
+    meta = make_meta(
+        slot_mapping=slot_mapping,
+        block_tables=[block_manager.block_table(seq_id) for seq_id in seq_ids],
+        context_lens=context_lens,
+        is_prefill=False,
+        device=device,
+    )
+    input_ids = torch.tensor(list(last_tokens), dtype=torch.long, device=device).unsqueeze(1)
+    # The newest token sits at position context_len - 1 (0-indexed RoPE position).
+    position_ids = torch.tensor([n - 1 for n in context_lens], dtype=torch.long, device=device).unsqueeze(1)
+    logits = model(input_ids, position_ids=position_ids, kv_cache=kv_cache, meta=meta)
+    return logits[:, -1, :]
+
+
+@torch.no_grad()
+def paged_generate(
+    model: MiniQwenForCausalLM,
+    kv_cache: PagedKVCache,
+    block_manager: BlockManager,
+    prompt_ids: Sequence[int],
+    *,
+    max_new_tokens: int,
+    eos_token_id: Optional[int] = None,
+    seq_id: int = 0,
+) -> List[int]:
+    """Greedy decode via the paged cache; must match reference_generate token for token."""
+
+    try:
+        last_logits = paged_prefill(model, kv_cache, block_manager, seq_id, prompt_ids)
+        output_ids = list(prompt_ids)
+        for _ in range(max_new_tokens):
+            next_token = int(torch.argmax(last_logits, dim=-1).item())
+            output_ids.append(next_token)
+            if eos_token_id is not None and next_token == eos_token_id:
+                break
+            step_logits = paged_decode_step(model, kv_cache, block_manager, [seq_id], [next_token])
+            last_logits = step_logits[0]
+        return output_ids
+    finally:
+        if block_manager.has_sequence(seq_id):
+            block_manager.free_sequence(seq_id)
 
 
 def logits_for_prompt(
