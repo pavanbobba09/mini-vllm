@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from engine.config import EngineConfig
 from engine.scheduler import Request, Scheduler
+from engine.telemetry import TelemetrySink
+from server.observability import PrometheusTelemetry, configure_json_logging
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -39,9 +41,16 @@ class EngineWorker:
     """Owns the scheduler on a dedicated thread; the model forward pass never
     blocks the event loop, and tokens stream back via call_soon_threadsafe."""
 
-    def __init__(self, model, tokenizer, engine_config: EngineConfig) -> None:
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        engine_config: EngineConfig,
+        telemetry: Optional[TelemetrySink] = None,
+    ) -> None:
         self.tokenizer = tokenizer
-        self.scheduler = Scheduler(model, engine_config)
+        self.scheduler = Scheduler(model, engine_config, telemetry=telemetry)
+        self.telemetry = self.scheduler.telemetry
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._subscribers: Dict[int, _Subscriber] = {}
@@ -82,6 +91,10 @@ class EngineWorker:
         with self._lock:
             self.scheduler.abort_request(request_id)
             self._subscribers.pop(request_id, None)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def _run(self) -> None:
         while True:
@@ -151,6 +164,7 @@ def create_app(
     worker: EngineWorker,
     model_name: str = DEFAULT_MODEL_ID,
     api_key: Optional[str] = None,
+    observability: Optional[PrometheusTelemetry] = None,
 ) -> FastAPI:
     app = FastAPI(title="mini-vllm")
 
@@ -167,9 +181,47 @@ def create_app(
                     )
             return await call_next(request)
 
+    if observability is not None:
+        @app.middleware("http")
+        async def observe_http_request(request, call_next):
+            start = time.perf_counter()
+            status = 500
+            try:
+                response = await call_next(request)
+                status = response.status_code
+                return response
+            finally:
+                observability.http_request(
+                    _metric_endpoint(request.url.path), status, time.perf_counter() - start
+                )
+
+        app.mount("/metrics", observability.metrics_app())
+
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse({"status": "ok", "model": model_name})
+        return JSONResponse(
+            {"status": "ok", "model": model_name, "worker_alive": worker.is_alive}
+        )
+
+    @app.get("/health/live")
+    async def liveness() -> JSONResponse:
+        return JSONResponse({"status": "alive"})
+
+    @app.get("/health/ready")
+    async def readiness() -> JSONResponse:
+        if not worker.is_alive:
+            return JSONResponse({"status": "not_ready", "worker_alive": False}, status_code=503)
+        # Reading the free-list length is safe enough for a health snapshot and,
+        # unlike taking the engine lock, never waits behind a long model forward.
+        pool = worker.scheduler.block_manager
+        payload = {
+            "status": "ready",
+            "model": model_name,
+            "worker_alive": True,
+            "free_kv_blocks": pool.num_free_blocks,
+            "total_kv_blocks": pool.num_blocks,
+        }
+        return JSONResponse(payload)
 
     @app.get("/v1/models")
     async def list_models() -> JSONResponse:
@@ -249,6 +301,20 @@ def create_app(
     return app
 
 
+def _metric_endpoint(path: str) -> str:
+    """Bound HTTP metric labels so arbitrary paths cannot create time series."""
+
+    return {
+        "/v1/completions": "completions",
+        "/v1/models": "models",
+        "/health": "health",
+        "/health/live": "liveness",
+        "/health/ready": "readiness",
+        "/metrics": "metrics",
+        "/metrics/": "metrics",
+    }.get(path, "other")
+
+
 async def _sse_stream(
     completion_id: str, created: int, model_name: str, streams: List[TokenStream]
 ) -> AsyncIterator[str]:
@@ -310,13 +376,18 @@ def main() -> None:
     args = parser.parse_args()
 
     engine = MiniVLLMEngine.from_pretrained(args.model, device=args.device, dtype=args.dtype)
+    telemetry = PrometheusTelemetry(args.model, logger=configure_json_logging())
     worker = EngineWorker(
         engine.model,
         engine.tokenizer,
         EngineConfig(num_blocks=args.num_blocks, max_num_seqs=args.max_num_seqs),
+        telemetry=telemetry,
     )
     app = create_app(
-        worker, model_name=args.model, api_key=os.environ.get("MINI_VLLM_API_KEY")
+        worker,
+        model_name=args.model,
+        api_key=os.environ.get("MINI_VLLM_API_KEY"),
+        observability=telemetry,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

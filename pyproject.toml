@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 server = [
   "fastapi>=0.110",
+  "prometheus-client>=0.20",
   "uvicorn>=0.29",
 ]
 dev = [
