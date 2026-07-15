@@ -273,3 +273,44 @@ transformers baseline at concurrency 1 and 8. p50 TTFT holds at 1.1-1.6s at
 every level while the static baseline sits at 3.8-10.7s. The concurrency-32
 throughput gap to fused kernels remains (239 vs 297 tok/s), as expected without
 a fused paged-attention kernel.
+
+## Milestone 6 - Engine Observability
+
+### Goal
+
+Make scheduler and cache behavior measurable before adding chunked prefill,
+prefix sharing, or a fused PagedAttention kernel. The acceptance bar is not a
+dashboard screenshot: lifecycle counts and timings must be testable, block
+gauges must return to their initial values, and telemetry must not contain
+prompt or generated-token payloads.
+
+### Backend boundary
+
+The engine depends on a `TelemetrySink` protocol and defaults to
+`NullTelemetry`; it does not import Prometheus or a logging implementation. The
+server injects `PrometheusTelemetry`, which owns a per-app registry so multiple
+test applications cannot collide on process-global metric names. This keeps
+benchmarks and direct scheduler use backend-neutral while making the CLI server
+observable by default.
+
+### Timing choices
+
+Lifecycle durations use `time.perf_counter`: queue time ends when admission
+begins, while TTFT includes prefill and first-token sampling. Prefill and decode
+histograms are host-observed and deliberately do not add a GPU synchronization.
+When fused CUDA work lands, sampled CUDA events are the correct way to add
+kernel timing without serializing every decode step.
+
+### Cardinality and privacy
+
+Metrics allow only bounded labels such as model, normalized endpoint, HTTP
+status, and finish reason. Request IDs belong in logs, never labels. Prompt
+text, generated text, token arrays, authorization headers, and API keys are not
+recorded by either signal.
+
+### Verification
+
+Focused tests cover request completion, TTFT recorded once, token counts,
+prefill/decode calls, aborts, full KV-block recovery, JSON lifecycle events,
+payload privacy, registry isolation, `/metrics`, and readiness. The full fast
+suite is then the regression oracle for the uninstrumented inference behavior.

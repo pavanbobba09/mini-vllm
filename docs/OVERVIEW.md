@@ -89,6 +89,7 @@ mini_llm/
 | M3 | Continuous batching scheduler: per-step admit/retire, budget, preemption | invariant tests; long request does not block short ones | **done** |
 | M4 | OpenAI-compatible server: /v1/completions, SSE, temperature/top_p | integration test with the official `openai` client | **done** |
 | M5 | Benchmarks vs vanilla transformers at concurrency 1/8/32 | tokens/sec, p50/p99 latency table in README | **done** |
+| M6 | Engine observability: metrics, lifecycle logs, health probes | metric lifecycle, privacy, registry-isolation, and endpoint tests | **done** |
 
 Rule: a milestone does not start until the previous one's tests are green.
 

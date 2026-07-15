@@ -3,6 +3,7 @@ so no request ever waits for an unrelated long sequence to finish."""
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,6 +16,7 @@ from engine.config import EngineConfig
 from engine.inference import paged_decode_step, paged_prefill
 from engine.kv_cache import PagedKVCache
 from engine.model import MiniQwenForCausalLM
+from engine.telemetry import NullTelemetry, SchedulerSnapshot, TelemetrySink
 
 
 class RequestState(Enum):
@@ -38,6 +40,11 @@ class Request:
     generated_ids: List[int] = field(default_factory=list)
     state: RequestState = RequestState.WAITING
     num_preemptions: int = 0
+    submitted_at: Optional[float] = None
+    admitted_at: Optional[float] = None
+    first_token_at: Optional[float] = None
+    last_token_at: Optional[float] = None
+    finished_at: Optional[float] = None
 
     @property
     def num_context_tokens(self) -> int:
@@ -61,9 +68,16 @@ class StepOutput:
 
 
 class Scheduler:
-    def __init__(self, model: MiniQwenForCausalLM, engine_config: EngineConfig) -> None:
+    def __init__(
+        self,
+        model: MiniQwenForCausalLM,
+        engine_config: EngineConfig,
+        telemetry: Optional[TelemetrySink] = None,
+    ) -> None:
         self.model = model
         self.config = engine_config
+        self._telemetry_enabled = telemetry is not None
+        self.telemetry: TelemetrySink = telemetry if telemetry is not None else NullTelemetry()
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
         self.kv_cache = PagedKVCache(
@@ -78,6 +92,8 @@ class Scheduler:
         )
         self.waiting: Deque[Request] = deque()
         self.running: List[Request] = []  # admission order: index 0 is oldest
+        if self._telemetry_enabled:
+            self.telemetry.scheduler_initialized(engine_config.num_blocks)
 
     def add_request(self, request: Request) -> None:
         prompt_len = len(request.prompt_ids)
@@ -96,6 +112,9 @@ class Scheduler:
             )
         request.state = RequestState.WAITING
         self.waiting.append(request)
+        if self._telemetry_enabled:
+            request.submitted_at = time.perf_counter()
+            self.telemetry.request_submitted(request)
 
     def _can_admit(self, request: Request) -> bool:
         if len(self.running) >= self.config.max_num_seqs:
@@ -108,9 +127,16 @@ class Scheduler:
         # Resume replays prompt + generated so far; greedy recompute lands on the
         # same continuation, which is why preemption is recompute-safe.
         context = request.prompt_ids + request.generated_ids
+        if self._telemetry_enabled and request.admitted_at is None:
+            request.admitted_at = time.perf_counter()
+            submitted_at = request.submitted_at or request.admitted_at
+            self.telemetry.request_admitted(request, request.admitted_at - submitted_at)
+        prefill_start = time.perf_counter() if self._telemetry_enabled else 0.0
         logits = paged_prefill(
             self.model, self.kv_cache, self.block_manager, request.request_id, context
         )
+        if self._telemetry_enabled:
+            self.telemetry.prefill_completed(len(context), time.perf_counter() - prefill_start)
         request.state = RequestState.RUNNING
         self.running.append(request)
         return self._sample(logits, request)
@@ -122,12 +148,16 @@ class Scheduler:
         victim.num_preemptions += 1
         self.block_manager.free_sequence(victim.request_id)
         self.waiting.appendleft(victim)
+        if self._telemetry_enabled:
+            self.telemetry.request_preempted(victim)
 
     def _needs_new_block(self, seq_id: int) -> bool:
         return self.block_manager.num_tokens(seq_id) % self.config.block_size == 0
 
     def step(self) -> StepOutput:
         """One engine iteration: admit, batched decode, retire."""
+
+        step_start = time.perf_counter() if self._telemetry_enabled else 0.0
 
         new_tokens: Dict[int, int] = {}
         finished: List[Request] = []
@@ -138,6 +168,8 @@ class Scheduler:
             request = self.waiting.popleft()
             token = self._admit(request)
             request.generated_ids.append(token)
+            if self._telemetry_enabled:
+                self._record_token(request)
             new_tokens[request.request_id] = token
             admitted_now.append(request)
 
@@ -147,6 +179,7 @@ class Scheduler:
             self._ensure_decode_capacity(decode_batch)
             decode_batch = [r for r in decode_batch if r.state is RequestState.RUNNING]
         if decode_batch:
+            decode_start = time.perf_counter() if self._telemetry_enabled else 0.0
             logits = paged_decode_step(
                 self.model,
                 self.kv_cache,
@@ -159,8 +192,14 @@ class Scheduler:
                 tokens = torch.argmax(logits, dim=-1).tolist()
             else:
                 tokens = [self._sample(logits[row], r) for row, r in enumerate(decode_batch)]
+            if self._telemetry_enabled:
+                self.telemetry.decode_completed(
+                    len(decode_batch), time.perf_counter() - decode_start
+                )
             for token, request in zip(tokens, decode_batch):
                 request.generated_ids.append(token)
+                if self._telemetry_enabled:
+                    self._record_token(request)
                 new_tokens[request.request_id] = token
 
         # Retire finished sequences now so their blocks free mid-batch.
@@ -169,12 +208,51 @@ class Scheduler:
             if request.is_done:
                 request.state = RequestState.FINISHED
                 self.block_manager.free_sequence(request.request_id)
+                if self._telemetry_enabled:
+                    request.finished_at = time.perf_counter()
+                    submitted_at = request.submitted_at or request.finished_at
+                    finish_reason = (
+                        "stop"
+                        if request.eos_token_id is not None
+                        and request.generated_ids
+                        and request.generated_ids[-1] == request.eos_token_id
+                        else "length"
+                    )
+                    self.telemetry.request_finished(
+                        request, request.finished_at - submitted_at, finish_reason
+                    )
                 finished.append(request)
             else:
                 still_running.append(request)
         self.running = still_running
 
+        if self._telemetry_enabled:
+            self.telemetry.tokens_generated(len(new_tokens))
+            free_blocks = self.block_manager.num_free_blocks
+            self.telemetry.scheduler_step(
+                SchedulerSnapshot(
+                    waiting_requests=len(self.waiting),
+                    running_requests=len(self.running),
+                    free_blocks=free_blocks,
+                    used_blocks=self.config.num_blocks - free_blocks,
+                    decode_batch_size=len(decode_batch),
+                    admitted_requests=len(admitted_now),
+                    generated_tokens=len(new_tokens),
+                    step_duration_seconds=time.perf_counter() - step_start,
+                )
+            )
+
         return StepOutput(new_tokens=new_tokens, finished=finished)
+
+    def _record_token(self, request: Request) -> None:
+        now = time.perf_counter()
+        if request.first_token_at is None:
+            request.first_token_at = now
+            submitted_at = request.submitted_at or now
+            self.telemetry.request_first_token(request, now - submitted_at)
+        elif request.last_token_at is not None:
+            self.telemetry.inter_token_latency(now - request.last_token_at)
+        request.last_token_at = now
 
     def _ensure_decode_capacity(self, decode_batch: List[Request]) -> None:
         # Capacity is checked BEFORE decoding; a mid-batch OutOfBlocksError would
@@ -197,14 +275,23 @@ class Scheduler:
             if request.request_id == request_id:
                 del self.waiting[i]
                 request.state = RequestState.ABORTED
+                if self._telemetry_enabled:
+                    self._record_abort(request)
                 return True
         for i, request in enumerate(self.running):
             if request.request_id == request_id:
                 self.running.pop(i)
                 self.block_manager.free_sequence(request_id)
                 request.state = RequestState.ABORTED
+                if self._telemetry_enabled:
+                    self._record_abort(request)
                 return True
         return False
+
+    def _record_abort(self, request: Request) -> None:
+        request.finished_at = time.perf_counter()
+        submitted_at = request.submitted_at or request.finished_at
+        self.telemetry.request_aborted(request, request.finished_at - submitted_at)
 
     @property
     def has_unfinished(self) -> bool:

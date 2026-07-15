@@ -162,6 +162,17 @@ So "is the math right", "is the cache right", "is the scheduling right", and
 suite (34 tests) uses a tiny random model and runs in seconds with no
 downloads; the slow suite checks the real checkpoint against HF.
 
+## Observability
+
+The CLI server enables Prometheus metrics at `/metrics`, JSON request lifecycle
+logs, and separate `/health/live` and `/health/ready` probes. Metrics cover queue
+delay, TTFT, inter-token latency, prefill/decode/scheduler duration, batch size,
+token throughput, preemption, and KV-block utilization. The engine depends only
+on a small telemetry interface and defaults to a no-op sink, so direct library
+and benchmark use stays monitoring-backend neutral. Metric definitions, privacy
+rules, and the optimization feedback loop are in
+[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+
 ## Benchmark
 
 Qwen2.5-0.5B-Instruct, fp16 on Apple MPS (8 GB machine). Workload per
@@ -218,6 +229,10 @@ MINI_VLLM_RUN_PARITY=1 MINI_VLLM_TEST_DEVICE=cpu MINI_VLLM_TEST_DTYPE=float32 \
 # start the server (first run downloads the model)
 .venv/bin/python -m server.api --port 8000
 
+# inspect Prometheus metrics and readiness
+curl -L http://localhost:8000/metrics
+curl http://localhost:8000/health/ready
+
 # benchmark against transformers (writes bench/results.md)
 .venv/bin/python -m bench.benchmark --concurrency 1 8 32
 ```
@@ -253,11 +268,14 @@ are in [docs/DEPLOY.md](docs/DEPLOY.md).
 | `engine/block_manager.py` | block allocator: free list, block tables, slot math |
 | `engine/kv_cache.py` | paged K/V tensors: slot scatter writes, block-table gather reads |
 | `engine/scheduler.py` | continuous batching: admit, batched decode, retire, preempt, abort |
+| `engine/telemetry.py` | backend-neutral lifecycle and scheduler measurement contract |
 | `server/api.py` | FastAPI `/v1/completions`: SSE streaming, sampling, disconnect handling |
+| `server/observability.py` | Prometheus registry, bounded metrics, and JSON lifecycle logs |
 | `bench/benchmark.py` | throughput/latency/TTFT comparison vs vanilla transformers |
 | `tests/` | fast tiny-model suite plus slow HF-parity suite |
 | `docs/decisions.md` | per-milestone design decisions and what changes at 10x scale |
 | `docs/OVERVIEW.md` | build plan, milestone status, ground rules |
+| `docs/OBSERVABILITY.md` | metrics, privacy rules, health probes, alerts, evaluation loop |
 
 ## Model facts worth knowing (Qwen2.5-0.5B-Instruct)
 
